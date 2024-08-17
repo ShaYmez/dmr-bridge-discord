@@ -13,10 +13,11 @@ documentation = "https://github.com/jess-sys/dmr-bridge-discord/README.md"
 categories = ["command-line-utilities", "multimedia::audio", "network-programming"]
 
 [dependencies]
-rodio = "0.17.1"
-songbird = "0.3.2"
-serenity = { version = "0.11.5", features = [ "voice" ]}
-tokio = { version = "1.28.0", features = ["full"] }
-chrono = "0.4.24"
-dotenv = "0.15.0"
-byteorder = "1.4.3"
+rodio = "=0.19.0"
+songbird = "=0.3.2"
+serenity = { version = "=0.11.7", features = [ "voice" ]}
+tokio = { version = "=1.38.0", features = ["full"] }
+chrono = "=0.4.38"
+dotenv = "=0.15.0"
+byteorder = "=1.5.0"
+futures = "0.3.30"

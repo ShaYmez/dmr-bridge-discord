@@ -1,18 +1,20 @@
-use byteorder::{ByteOrder, LittleEndian};
-use dmr_bridge_discord::packet::USRP;
-use rodio::buffer::SamplesBuffer;
-
-use rodio::dynamic_mixer::mixer;
-use serenity::prelude::Mutex as SerenityMutex;
-use songbird::input::{Codec, Container, Reader};
-use songbird::{input::Input, Call};
 use std::env;
 use std::net::UdpSocket;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
+use std::sync::mpsc::channel;
 use std::thread;
 use std::time::Duration;
-use tokio::runtime::Runtime;
+
+use byteorder::{ByteOrder, LittleEndian};
+use futures::executor::block_on;
+use rodio::buffer::SamplesBuffer;
+use rodio::source::UniformSourceIterator;
+use serenity::prelude::Mutex as SerenityMutex;
+use songbird::{Call, input::Input};
+use songbird::input::{Codec, Container, Reader};
+
+use dmr_bridge_discord::packet::{PacketType, USRP};
 
 pub struct Receiver {
     discord_channel: Arc<Mutex<Option<Arc<SerenityMutex<Call>>>>>,
@@ -28,67 +30,51 @@ impl Receiver {
         let socket =
             UdpSocket::bind(dmr_local_rx_addr).expect("Couldn't bind udp socket for reception");
 
-        let discord_channel = Arc::new(Mutex::new(None));
+        let discord_channel_mutex: Arc<Mutex<Option<Arc<SerenityMutex<Call>>>>> =
+            Arc::new(Mutex::new(None));
 
-        let channel = Arc::clone(&discord_channel);
+        let discord_channel = Arc::clone(&discord_channel_mutex);
 
-        let (mixer_controller, mixer) = mixer(2, 48000);
+        let (tx, rx) = channel::<USRP>();
+
+        thread::spawn(move || loop {
+            if let Ok(usrp_packet) = rx.recv() {
+                let source = SamplesBuffer::new(1, 8000, usrp_packet.audio);
+                let uniform_source = UniformSourceIterator::new(source, 1, 48000);
+                let mut uniform_source_data: Vec<i16> = uniform_source.collect();
+                uniform_source_data.resize(960, 0);
+                let mut audio_data: [u8; 1920] = [0; 1920];
+                LittleEndian::write_i16_into(&uniform_source_data, &mut audio_data);
+                let audio = Input::new(
+                    false,
+                    Reader::from(Vec::from(audio_data)),
+                    Codec::Pcm,
+                    Container::Raw,
+                    None,
+                );
+                if let Ok(channel) = discord_channel.lock() {
+                    if let Some(device) = channel.deref() {
+                        let mut call = block_on(device.lock());
+                        let handle = call.play_source(audio);
+                        let duration = handle.metadata().duration.unwrap_or(Duration::from_millis(20));
+                        thread::sleep(duration);
+                    }
+                }
+            }
+        });
 
         thread::spawn(move || {
             let mut buffer = [0u8; 352];
-            let mut discord_voice_buffer = [0i16; 1920];
-            let mut discord_voice_buffer_as_bytes = [0u8; 3840];
-            let mut discord_voice_buffer_index = 0;
-            let mut mixer = mixer.peekable();
-
             loop {
                 match socket.recv(&mut buffer) {
-                    Ok(packet_size) => {
-                        if packet_size >= 32 {
-                            if let Some(usrp_packet) = USRP::from_buffer(buffer) {
-                                println!("Received USRP voice audio packet");
-                                let source = SamplesBuffer::new(1, 8000, usrp_packet.audio);
-                                mixer_controller.add(source);
-                                while discord_voice_buffer_index < discord_voice_buffer.len() {
-                                    let sample = mixer.next();
-                                    if let Some(sample) = sample {
-                                        discord_voice_buffer[discord_voice_buffer_index] = sample;
-                                    } else {
-                                        break;
-                                    }
-                                    discord_voice_buffer_index += 1;
-                                }
-                                if discord_voice_buffer_index == discord_voice_buffer.len() {
-                                    LittleEndian::write_i16_into(
-                                        &discord_voice_buffer,
-                                        &mut discord_voice_buffer_as_bytes,
-                                    );
-                                    let audio = Input::new(
-                                        false,
-                                        Reader::from_memory(Vec::from(
-                                            discord_voice_buffer_as_bytes,
-                                        )),
-                                        Codec::Pcm,
-                                        Container::Raw,
-                                        None,
-                                    );
-                                    {
-                                        let channel: MutexGuard<Option<Arc<SerenityMutex<Call>>>> =
-                                            channel.lock().unwrap();
-                                        if let Some(device) = channel.deref() {
-                                            let rt = Runtime::new().unwrap();
-                                            let mut call =
-                                                rt.block_on(async { device.lock().await });
-                                            println!("Sent Discord voice audio packet");
-                                            call.play_source(audio);
-                                            const TWO_MILLIS: Duration = Duration::from_millis(2);
-                                            thread::sleep(TWO_MILLIS);
-                                        }
-                                    }
-                                }
+                    Ok(32..) => {
+                        if let Some(usrp_packet) = USRP::from_buffer(buffer) {
+                            if usrp_packet.packet_type == PacketType::Voice {
+                                tx.send(usrp_packet).unwrap();
                             }
                         }
                     }
+                    Ok(_) => {}
                     Err(_) => return,
                 }
             }
@@ -96,7 +82,9 @@ impl Receiver {
 
         println!("Receiver started");
 
-        Self { discord_channel }
+        Self {
+            discord_channel: discord_channel_mutex,
+        }
     }
 
     pub fn set(&mut self, device: Arc<SerenityMutex<Call>>) {

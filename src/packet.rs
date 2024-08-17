@@ -1,10 +1,12 @@
-use byteorder::{ByteOrder, NetworkEndian};
+use byteorder::{ByteOrder, LittleEndian};
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
+#[repr(u32)]
 pub enum PacketType {
     Voice = 0,
     DualToneMultiFrequency = 1,
     Text = 2,
+    Unknown = u32::MAX,
 }
 
 impl From<u32> for PacketType {
@@ -13,7 +15,7 @@ impl From<u32> for PacketType {
             0 => PacketType::Voice,
             1 => PacketType::DualToneMultiFrequency,
             2 => PacketType::Text,
-            _ => panic!("Invalid packet type"),
+            _ => PacketType::Unknown,
         }
     }
 }
@@ -24,6 +26,7 @@ impl From<PacketType> for u32 {
             PacketType::Voice => 0,
             PacketType::DualToneMultiFrequency => 1,
             PacketType::Text => 2,
+            PacketType::Unknown => u32::MAX,
         }
     }
 }
@@ -63,15 +66,15 @@ impl USRP {
             None
         } else {
             let mut audio = [0i16; 160];
-            NetworkEndian::read_i16_into(&buffer[32..352], &mut audio);
+            LittleEndian::read_i16_into(&buffer[32..352], &mut audio);
             Some(Self {
-                sequence_counter: NetworkEndian::read_u32(&buffer[4..8]),
-                stream_id: NetworkEndian::read_u32(&buffer[8..12]),
-                push_to_talk: NetworkEndian::read_u32(&buffer[12..16]) != 0,
-                talk_group: NetworkEndian::read_u32(&buffer[16..20]),
-                packet_type: NetworkEndian::read_u32(&buffer[20..24]).into(),
-                multiplex_id: NetworkEndian::read_u32(&buffer[24..28]),
-                reserved: NetworkEndian::read_u32(&buffer[28..32]),
+                sequence_counter: LittleEndian::read_u32(&buffer[4..8]),
+                stream_id: LittleEndian::read_u32(&buffer[8..12]),
+                push_to_talk: LittleEndian::read_u32(&buffer[12..16]) != 0,
+                talk_group: LittleEndian::read_u32(&buffer[16..20]),
+                packet_type: LittleEndian::read_u32(&buffer[20..24]).into(),
+                multiplex_id: LittleEndian::read_u32(&buffer[24..28]),
+                reserved: LittleEndian::read_u32(&buffer[28..32]),
                 audio,
             })
         }
@@ -80,14 +83,14 @@ impl USRP {
     pub fn to_buffer(&self) -> [u8; 352] {
         let mut buffer = [0u8; 352];
         buffer[..4].copy_from_slice(b"USRP");
-        NetworkEndian::write_u32(&mut buffer[4..8], self.sequence_counter);
-        NetworkEndian::write_u32(&mut buffer[8..12], self.stream_id);
-        NetworkEndian::write_u32(&mut buffer[12..16], self.push_to_talk.into());
-        NetworkEndian::write_u32(&mut buffer[16..20], self.talk_group);
-        NetworkEndian::write_u32(&mut buffer[20..24], self.packet_type.into());
-        NetworkEndian::write_u32(&mut buffer[24..28], self.multiplex_id);
-        NetworkEndian::write_u32(&mut buffer[28..32], self.reserved);
-        NetworkEndian::write_i16_into(&self.audio, &mut buffer[32..352]);
+        LittleEndian::write_u32(&mut buffer[4..8], self.sequence_counter);
+        LittleEndian::write_u32(&mut buffer[8..12], self.stream_id);
+        LittleEndian::write_u32(&mut buffer[12..16], self.push_to_talk.into());
+        LittleEndian::write_u32(&mut buffer[16..20], self.talk_group);
+        LittleEndian::write_u32(&mut buffer[20..24], self.packet_type.into());
+        LittleEndian::write_u32(&mut buffer[24..28], self.multiplex_id);
+        LittleEndian::write_u32(&mut buffer[28..32], self.reserved);
+        LittleEndian::write_i16_into(&self.audio, &mut buffer[32..352]);
         buffer
     }
 }
