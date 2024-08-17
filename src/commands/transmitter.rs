@@ -96,7 +96,6 @@ impl Transmitter {
                         ..Default::default()
                     };
                     sequence += 1;
-                    println!("Send end packet");
                     socket
                         .send(&usrp_packet.to_buffer())
                         .expect("Failed to send USRP voice end packet");
