@@ -1,17 +1,20 @@
-use dmr_bridge_discord::packet::{PacketType, USRP};
-use rodio::dynamic_mixer::{mixer, DynamicMixerController};
-use serenity::async_trait;
+use std::{env, thread, time};
 use std::net::UdpSocket;
 use std::sync::Arc;
+use std::sync::mpsc::{channel, Sender};
 use std::time::Duration;
-use std::{env, thread, time};
 
 use rodio::buffer::SamplesBuffer;
-
+use rodio::dynamic_mixer::mixer;
+use rodio::Source;
+use rodio::source::UniformSourceIterator;
+use serenity::async_trait;
 use songbird::{Event, EventContext, EventHandler as VoiceEventHandler};
 
+use dmr_bridge_discord::packet::USRP;
+
 pub struct Transmitter {
-    mixer_controller: Arc<DynamicMixerController<i16>>,
+    tx: Sender<Vec<i16>>,
 }
 
 pub struct TransmitterWrapper {
@@ -33,7 +36,7 @@ impl VoiceEventHandler for TransmitterWrapper {
 
 impl Transmitter {
     pub fn new() -> Self {
-        // You can manage state here, such as a buffer of audio packet bytes so
+        // You can manage state here, such as a buffer of audio packet bytes, so
         // you can later store them in intervals.
         let dmr_target_rx_addr =
             env::var("TARGET_RX_ADDR").expect("Expected a target rx address in the environment");
@@ -45,15 +48,24 @@ impl Transmitter {
             .connect(dmr_target_rx_addr)
             .expect("Couldn't connect to DMR audio receiver");
 
-        let (mixer_controller, mixer) = mixer(1, 8000);
+        let (mixer_controller, mut mixer) = mixer(1, 8000);
+        let (tx, rx) = channel::<Vec<i16>>();
+
+        thread::spawn(move || loop {
+            if let Ok(audio_packet) = rx.recv() {
+                let source = SamplesBuffer::new(2, 48000, audio_packet);
+                let uniform_source = UniformSourceIterator::new(source, 1, 8000);
+                let mut uniform_source_data: Vec<i16> = uniform_source.collect();
+                uniform_source_data.resize(160, 0);
+                let source = SamplesBuffer::new(1, 8000, uniform_source_data);
+                mixer_controller.add(source);
+            }
+        });
 
         thread::spawn(move || {
             let mut sequence = 0;
-            let mut mixer = mixer.peekable();
             let mut last_time_streaming_audio = time::Instant::now();
             let mut talked_since_last_time_streaming_audio = false;
-            let mut usrp_voice_buffer = [0i16; 160];
-            let mut usrp_voice_buffer_index = 0;
 
             loop {
                 if talked_since_last_time_streaming_audio
@@ -63,50 +75,28 @@ impl Transmitter {
                         > 20
                 {
                     talked_since_last_time_streaming_audio = false;
-                    const EMPTY_VOICE_BUFFER: [i16; 160] = [0i16; 160];
                     let usrp_packet = USRP {
                         sequence_counter: sequence,
-                        stream_id: 0,
-                        push_to_talk: false,
-                        talk_group: 0,
-                        packet_type: PacketType::Voice,
-                        multiplex_id: 0,
-                        reserved: 0,
-                        audio: EMPTY_VOICE_BUFFER,
-                    }
-                    .to_buffer();
-                    socket
-                        .send(&usrp_packet)
-                        .expect("Failed to send USRP voice end packet");
-                    println!("Sent USRP voice end packet");
+                        ..Default::default()
+                    };
                     sequence += 1;
+                    socket
+                        .send(&usrp_packet.to_buffer())
+                        .expect("Failed to send USRP voice end packet");
                 }
-                if mixer.peek().is_none() {
-                    const TWO_MILLIS: Duration = Duration::from_millis(2);
-                    thread::sleep(TWO_MILLIS);
-                    continue;
-                }
-                while usrp_voice_buffer_index < usrp_voice_buffer.len() {
-                    let sample = mixer.next();
-                    if let Some(sample) = sample {
-                        usrp_voice_buffer[usrp_voice_buffer_index] = sample;
-                    } else {
-                        break;
-                    }
-                    usrp_voice_buffer_index += 1;
-                }
-                if usrp_voice_buffer_index == usrp_voice_buffer.len() {
-                    println!("Received Discord voice audio packet");
-                    usrp_voice_buffer_index = 0;
+                let mut audio: Vec<i16> = mixer
+                    .by_ref()
+                    .take_duration(Duration::from_millis(20))
+                    .collect();
+                if !audio.is_empty() {
+                    audio.resize(160, 0);
+                    let mut audio_packet = [0i16; 160];
+                    audio_packet.clone_from_slice(&audio);
                     let usrp_packet = USRP {
                         sequence_counter: sequence,
-                        stream_id: 0,
                         push_to_talk: true,
-                        talk_group: 0,
-                        packet_type: PacketType::Voice,
-                        multiplex_id: 0,
-                        reserved: 0,
-                        audio: usrp_voice_buffer,
+                        audio: audio_packet,
+                        ..Default::default()
                     };
                     sequence += 1;
                     socket
@@ -115,15 +105,13 @@ impl Transmitter {
                     println!("Sent USRP voice audio packet");
                     last_time_streaming_audio = time::Instant::now();
                     talked_since_last_time_streaming_audio = true;
-                } else {
-                    println!("Received incomplete Discord voice audio packet");
                 }
             }
         });
 
         println!("Transmitter started");
 
-        Self { mixer_controller }
+        Self { tx }
     }
 }
 
@@ -133,19 +121,11 @@ impl VoiceEventHandler for Transmitter {
         use EventContext as Ctx;
         match ctx {
             Ctx::VoicePacket(data) => {
-                // An event which fires for every received audio packet,
-                // containing the decoded data.
                 if let Some(audio) = data.audio {
-                    if !audio.is_empty() {
-                        self.mixer_controller
-                            .add(SamplesBuffer::new(2, 48000, audio.clone()));
-                    }
-                } else {
-                    println!("RTP packet, but no audio. Driver may not be configured to decode.");
+                    self.tx.send(audio.clone()).unwrap();
                 }
             }
             _ => {
-                // We won't be registering this struct for any more event classes.
                 unimplemented!()
             }
         }

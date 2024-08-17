@@ -1,4 +1,4 @@
-use byteorder::{ByteOrder, LittleEndian};
+use byteorder::{BigEndian, ByteOrder, LittleEndian};
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(u32)]
@@ -68,13 +68,13 @@ impl USRP {
             let mut audio = [0i16; 160];
             LittleEndian::read_i16_into(&buffer[32..352], &mut audio);
             Some(Self {
-                sequence_counter: LittleEndian::read_u32(&buffer[4..8]),
-                stream_id: LittleEndian::read_u32(&buffer[8..12]),
-                push_to_talk: LittleEndian::read_u32(&buffer[12..16]) != 0,
-                talk_group: LittleEndian::read_u32(&buffer[16..20]),
+                sequence_counter: BigEndian::read_u32(&buffer[4..8]),
+                stream_id: BigEndian::read_u32(&buffer[8..12]),
+                push_to_talk: BigEndian::read_u32(&buffer[12..16]) != 0,
+                talk_group: BigEndian::read_u32(&buffer[16..20]),
                 packet_type: LittleEndian::read_u32(&buffer[20..24]).into(),
-                multiplex_id: LittleEndian::read_u32(&buffer[24..28]),
-                reserved: LittleEndian::read_u32(&buffer[28..32]),
+                multiplex_id: BigEndian::read_u32(&buffer[24..28]),
+                reserved: BigEndian::read_u32(&buffer[28..32]),
                 audio,
             })
         }
@@ -83,13 +83,13 @@ impl USRP {
     pub fn to_buffer(&self) -> [u8; 352] {
         let mut buffer = [0u8; 352];
         buffer[..4].copy_from_slice(b"USRP");
-        LittleEndian::write_u32(&mut buffer[4..8], self.sequence_counter);
-        LittleEndian::write_u32(&mut buffer[8..12], self.stream_id);
-        LittleEndian::write_u32(&mut buffer[12..16], self.push_to_talk.into());
-        LittleEndian::write_u32(&mut buffer[16..20], self.talk_group);
+        BigEndian::write_u32(&mut buffer[4..8], self.sequence_counter);
+        BigEndian::write_u32(&mut buffer[8..12], self.stream_id);
+        BigEndian::write_u32(&mut buffer[12..16], self.push_to_talk.into());
+        BigEndian::write_u32(&mut buffer[16..20], self.talk_group);
         LittleEndian::write_u32(&mut buffer[20..24], self.packet_type.into());
-        LittleEndian::write_u32(&mut buffer[24..28], self.multiplex_id);
-        LittleEndian::write_u32(&mut buffer[28..32], self.reserved);
+        BigEndian::write_u32(&mut buffer[24..28], self.multiplex_id);
+        BigEndian::write_u32(&mut buffer[28..32], self.reserved);
         LittleEndian::write_i16_into(&self.audio, &mut buffer[32..352]);
         buffer
     }
