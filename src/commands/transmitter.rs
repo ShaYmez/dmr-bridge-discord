@@ -1,12 +1,11 @@
-use std::{env, thread, time};
+use std::{env, thread};
 use std::net::UdpSocket;
 use std::sync::Arc;
 use std::sync::mpsc::{channel, Sender};
-use std::time::Duration;
+use std::time::Instant;
 
 use rodio::buffer::SamplesBuffer;
 use rodio::dynamic_mixer::mixer;
-use rodio::Source;
 use rodio::source::UniformSourceIterator;
 use serenity::async_trait;
 use songbird::{Event, EventContext, EventHandler as VoiceEventHandler};
@@ -47,6 +46,7 @@ impl Transmitter {
         socket
             .connect(dmr_target_rx_addr)
             .expect("Couldn't connect to DMR audio receiver");
+        socket.set_nonblocking(true).expect("TODO: panic message");
 
         let (mixer_controller, mut mixer) = mixer(1, 8000);
         let (tx, rx) = channel::<Vec<i16>>();
@@ -64,30 +64,10 @@ impl Transmitter {
 
         thread::spawn(move || {
             let mut sequence = 0;
-            let mut last_time_streaming_audio = time::Instant::now();
-            let mut talked_since_last_time_streaming_audio = false;
+            let mut last_time_streaming_audio: Option<Instant> = None;
 
             loop {
-                if talked_since_last_time_streaming_audio
-                    && last_time_streaming_audio
-                        .duration_since(time::Instant::now())
-                        .as_millis()
-                        > 20
-                {
-                    talked_since_last_time_streaming_audio = false;
-                    let usrp_packet = USRP {
-                        sequence_counter: sequence,
-                        ..Default::default()
-                    };
-                    sequence += 1;
-                    socket
-                        .send(&usrp_packet.to_buffer())
-                        .expect("Failed to send USRP voice end packet");
-                }
-                let mut audio: Vec<i16> = mixer
-                    .by_ref()
-                    .take_duration(Duration::from_millis(20))
-                    .collect();
+                let mut audio: Vec<i16> = mixer.by_ref().take(160).collect();
                 if !audio.is_empty() {
                     audio.resize(160, 0);
                     let mut audio_packet = [0i16; 160];
@@ -102,9 +82,24 @@ impl Transmitter {
                     socket
                         .send(&usrp_packet.to_buffer())
                         .expect("Failed to send USRP voice audio packet");
-                    println!("Sent USRP voice audio packet");
-                    last_time_streaming_audio = time::Instant::now();
-                    talked_since_last_time_streaming_audio = true;
+                    last_time_streaming_audio = Some(Instant::now());
+                }
+                if last_time_streaming_audio.is_some()
+                    && Instant::now()
+                        .duration_since(last_time_streaming_audio.unwrap())
+                        .as_millis()
+                        > 200
+                {
+                    last_time_streaming_audio = None;
+                    let usrp_packet = USRP {
+                        sequence_counter: sequence,
+                        ..Default::default()
+                    };
+                    sequence += 1;
+                    println!("Send end packet");
+                    socket
+                        .send(&usrp_packet.to_buffer())
+                        .expect("Failed to send USRP voice end packet");
                 }
             }
         });
