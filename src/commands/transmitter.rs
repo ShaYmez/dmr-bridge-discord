@@ -1,9 +1,12 @@
 use std::{env, thread};
+use std::fs::File;
+use std::io::Write;
 use std::net::UdpSocket;
 use std::sync::Arc;
-use std::sync::mpsc::{channel, Sender};
-use std::time::Instant;
+use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
+use std::time::Duration;
 
+use byteorder::{ByteOrder, LittleEndian};
 use rodio::buffer::SamplesBuffer;
 use rodio::dynamic_mixer::mixer;
 use rodio::source::UniformSourceIterator;
@@ -48,58 +51,66 @@ impl Transmitter {
             .expect("Couldn't connect to DMR audio receiver");
         socket.set_nonblocking(true).expect("TODO: panic message");
 
-        let (mixer_controller, mut mixer) = mixer(1, 8000);
         let (tx, rx) = channel::<Vec<i16>>();
 
+        let mut file = File::create("./audio.pcm").unwrap();
+        let mut sequence: u32 = 0;
+        let mut sent_audio = false;
+        let mut buffer: Vec<i16> = Vec::new();
+
         thread::spawn(move || loop {
-            if let Ok(audio_packet) = rx.recv() {
-                let source = SamplesBuffer::new(2, 48000, audio_packet);
-                let uniform_source = UniformSourceIterator::new(source, 1, 8000);
-                let mut uniform_source_data: Vec<i16> = uniform_source.collect();
-                uniform_source_data.resize(160, 0);
-                let source = SamplesBuffer::new(1, 8000, uniform_source_data);
-                mixer_controller.add(source);
+            let mut pulled_audio = Vec::with_capacity(160);
+            let mut communication_end = false;
+            while pulled_audio.len() < 160 {
+                pulled_audio.extend(buffer.iter().by_ref().take(160 - pulled_audio.len()));
+                if pulled_audio.len() != 160 {
+                    match rx.recv_timeout(Duration::from_millis(200)) {
+                        Ok(audio_packet) => {
+                            buffer.extend(audio_packet);
+                        }
+                        Err(RecvTimeoutError::Timeout) => {
+                            if sent_audio {
+                                communication_end = true;
+                                println!("Communication ended");
+                                break;
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
             }
-        });
-
-        thread::spawn(move || {
-            let mut sequence = 0;
-            let mut last_time_streaming_audio: Option<Instant> = None;
-
-            loop {
-                let mut audio: Vec<i16> = mixer.by_ref().take(160).collect();
-                if !audio.is_empty() {
-                    audio.resize(160, 0);
-                    let mut audio_packet = [0i16; 160];
-                    audio_packet.clone_from_slice(&audio);
-                    let usrp_packet = USRP {
-                        sequence_counter: sequence,
-                        push_to_talk: true,
-                        audio: audio_packet,
-                        ..Default::default()
-                    };
-                    sequence += 1;
-                    socket
-                        .send(&usrp_packet.to_buffer())
-                        .expect("Failed to send USRP voice audio packet");
-                    last_time_streaming_audio = Some(Instant::now());
+            if !pulled_audio.is_empty() {
+                let mut audio_packet = [0i16; 160];
+                if pulled_audio.len() != 160 {
+                    pulled_audio.resize(160, 0);
                 }
-                if last_time_streaming_audio.is_some()
-                    && Instant::now()
-                        .duration_since(last_time_streaming_audio.unwrap())
-                        .as_millis()
-                        > 200
-                {
-                    last_time_streaming_audio = None;
-                    let usrp_packet = USRP {
-                        sequence_counter: sequence,
-                        ..Default::default()
-                    };
-                    sequence += 1;
-                    socket
-                        .send(&usrp_packet.to_buffer())
-                        .expect("Failed to send USRP voice end packet");
-                }
+                audio_packet.clone_from_slice(&pulled_audio);
+                let usrp_packet = USRP {
+                    sequence_counter: sequence,
+                    push_to_talk: true,
+                    audio: audio_packet,
+                    ..Default::default()
+                };
+                /*socket
+                .send(&usrp_packet.to_buffer())
+                .expect("Failed to send USRP voice end packet");*/
+                sent_audio = true;
+                sequence += 1;
+                let mut audio_packet = [0u8; 320];
+                LittleEndian::write_i16_into(&usrp_packet.audio, &mut audio_packet);
+                file.write_all(&audio_packet).expect("TODO: panic message");
+            }
+
+            if communication_end {
+                let usrp_packet = USRP {
+                    sequence_counter: sequence,
+                    ..Default::default()
+                };
+                sequence += 1;
+                /*socket
+                .send(&usrp_packet.to_buffer())
+                .expect("Failed to send USRP voice end packet");*/
+                sent_audio = false;
             }
         });
 
@@ -114,9 +125,22 @@ impl VoiceEventHandler for Transmitter {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         use EventContext as Ctx;
         match ctx {
-            Ctx::VoicePacket(data) => {
-                if let Some(audio) = data.audio {
-                    self.tx.send(audio.clone()).unwrap();
+            Ctx::VoiceTick(data) => {
+                let (mixer_controller, mixer) = mixer(1, 8000);
+                for (_, audio) in data.speaking.iter() {
+                    let audio_packet = audio.decoded_voice.clone();
+                    if let Some(audio_packet) = audio_packet {
+                        let source = SamplesBuffer::new(2, 48000, audio_packet);
+                        let uniform_source = UniformSourceIterator::new(source, 1, 8000);
+                        let uniform_source_data: Vec<i16> = uniform_source.collect();
+                        let source = SamplesBuffer::new(1, 8000, uniform_source_data);
+                        mixer_controller.add(source);
+                    }
+                }
+                let audio_packet: Vec<i16> = mixer.collect();
+                match self.tx.send(audio_packet) {
+                    Ok(_) => {}
+                    Err(_) => {}
                 }
             }
             _ => {

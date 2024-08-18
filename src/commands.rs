@@ -1,156 +1,87 @@
-use serenity::{
-    client::Context,
-    framework::standard::{
-        macros::{command, group},
-        CommandResult,
-    },
-    model::channel::Message,
-    prelude::{Mentionable, Mutex, TypeMapKey},
-    Result as SerenityResult,
-};
-
-use songbird::CoreEvent;
-
 use std::sync::Arc;
+use serenity::all::{ChannelId, GuildId};
+use songbird::{CoreEvent, Event};
+
+use transmitter::Transmitter;
+
+use crate::commands::receiver::Receiver;
+use crate::commands::transmitter::TransmitterWrapper;
+use crate::{Context, Error};
 
 pub mod receiver;
 pub mod transmitter;
 
-use chrono::prelude::Utc;
-use transmitter::Transmitter;
-
-use crate::commands::transmitter::TransmitterWrapper;
-use receiver::Receiver;
-
-pub struct DMRReceiver;
-
-impl TypeMapKey for DMRReceiver {
-    type Value = Arc<Mutex<Receiver>>;
+pub fn retrieve_voice_channel(ctx: Context<'_>) -> Option<(GuildId, ChannelId)> {
+    let guild = ctx.guild();
+    guild.and_then(|guild| {
+        if let Some(channel_id) = guild
+            .voice_states
+            .get(&ctx.author().id)
+            .and_then(|voice_state| voice_state.channel_id) {
+            Some((guild.id, channel_id))
+        } else {
+            None
+        }
+    })
 }
 
-#[group]
-#[commands(join, leave, ping)]
-pub struct General;
-
-#[command]
-#[only_in(guilds)]
-async fn join(ctx: &Context, msg: &Message) -> CommandResult {
-    let guild = msg.guild(&ctx.cache).unwrap();
-    let guild_id = guild.id;
-
-    let channel_id = guild
-        .voice_states
-        .get(&msg.author.id)
-        .and_then(|voice_state| voice_state.channel_id);
-
-    let channel = match channel_id {
-        Some(channel) => channel,
-        None => {
-            check_msg(msg.reply(ctx, "⚠️ Not in a voice channel").await);
-
-            return Ok(());
-        }
-    };
-
-    let manager = songbird::get(ctx)
+#[poise::command(slash_command)]
+pub async fn join(ctx: Context<'_>) -> Result<(), Error> {
+    let manager = songbird::get(ctx.serenity_context())
         .await
         .expect("Songbird Voice client placed in at initialisation.")
         .clone();
-
-    let (handler_lock, conn_result) = manager.join(guild_id, channel).await;
-
-    if conn_result.is_ok() {
-        // NOTE: this skips listening for the actual connection result.
-        let mut handler = handler_lock.lock().await;
-
-        let transmitter = Arc::new(Transmitter::new());
-        let voice_packet_transmitter = TransmitterWrapper::new(transmitter.clone());
-        handler.add_global_event(CoreEvent::VoicePacket.into(), voice_packet_transmitter);
-
-        let receiver_lock = {
-            let data_read = ctx.data.read().await;
-            data_read
-                .get::<DMRReceiver>()
-                .expect("Expected DMRReceiver in TypeMap.")
-                .clone()
-        };
-
-        {
-            let mut receiver = receiver_lock.lock().await;
-            receiver.set(handler_lock.clone());
+    if let Some((guild_id, channel_id)) = retrieve_voice_channel(ctx) {
+        if let Ok(call) = manager.join(guild_id, channel_id).await {
+            let cloned_call = Arc::clone(&call);
+            let mut locked_call = call.lock().await;
+            {
+                let receiver = ctx.data().receiver.clone();
+                let mut locked_receiver = receiver.lock().await;
+                *locked_receiver = Some(Receiver::new(cloned_call));
+            }
+            {
+                let transmitter = ctx.data().transmitter.clone();
+                let mut locked_transmitter = transmitter.lock().await;
+                let new_transmitter = Arc::new(Transmitter::new());
+                let new_transmitter_cloned = Arc::clone(&new_transmitter);
+                let new_transmitter_wrapper = TransmitterWrapper::new(new_transmitter);
+                locked_call.remove_all_global_events();
+                locked_call.add_global_event(
+                    Event::Core(CoreEvent::VoiceTick),
+                    new_transmitter_wrapper,
+                );
+                *locked_transmitter = Some(new_transmitter_cloned);
+            }
         }
-
-        check_msg(
-            msg.reply(ctx, &format!("Joined {}", channel.mention()))
-                .await,
-        );
     } else {
-        check_msg(msg.reply(ctx, "Error joining the channel").await);
+        /* User isn't connect to a voice channel */
     }
-
     Ok(())
 }
 
-#[command]
-#[only_in(guilds)]
-async fn leave(ctx: &Context, msg: &Message) -> CommandResult {
-    let guild = msg.guild(&ctx.cache).unwrap();
-    let guild_id = guild.id;
-
-    let channel_id = guild
-        .voice_states
-        .get(&msg.author.id)
-        .and_then(|voice_state| voice_state.channel_id)
-        .unwrap();
-
-    let manager = songbird::get(ctx)
+#[poise::command(slash_command)]
+pub async fn leave(ctx: Context<'_>) -> Result<(), Error> {
+    let manager = songbird::get(ctx.serenity_context())
         .await
         .expect("Songbird Voice client placed in at initialisation.")
         .clone();
-    let has_handler = manager.get(guild_id).is_some();
-
-    if has_handler {
-        let receiver_lock = {
-            let data_read = ctx.data.read().await;
-            data_read
-                .get::<DMRReceiver>()
-                .expect("Expected DMRReceiver in TypeMap.")
-                .clone()
-        };
-
-        {
-            let mut receiver = receiver_lock.lock().await;
-            receiver.unset();
+    if let Some(guild_id) = ctx.guild().map(|guild| guild.id) {
+        if let Some(call) = manager.get(guild_id) {
+            let mut locked_call = call.lock().await;
+            locked_call.leave().await.expect("TODO: panic message");
+            {
+                let receiver = ctx.data().receiver.clone();
+                let mut locked_receiver = receiver.lock().await;
+                *locked_receiver = None;
+            }
+            {
+                let transmitter = ctx.data().transmitter.clone();
+                let mut locked_transmitter = transmitter.lock().await;
+                locked_call.remove_all_global_events();
+                *locked_transmitter = None;
+            }
         }
-
-        if let Err(e) = manager.remove(guild_id).await {
-            check_msg(msg.reply(ctx, format!("Failed: {:?}", e)).await);
-        }
-        check_msg(
-            msg.reply(ctx, &format!("Left {}", channel_id.mention()))
-                .await,
-        );
-    } else {
-        check_msg(msg.reply(ctx, "⚠️ Not in a voice channel").await);
     }
-
     Ok(())
-}
-
-#[command]
-async fn ping(ctx: &Context, msg: &Message) -> CommandResult {
-    let now = Utc::now();
-    let elapsed = now - *msg.timestamp;
-    check_msg(
-        msg.reply(ctx, format!("Pong! ({} ms)", elapsed.num_milliseconds()))
-            .await,
-    );
-
-    Ok(())
-}
-
-fn check_msg(result: SerenityResult<Message>) {
-    if let Err(why) = result {
-        println!("Error sending message: {:?}", why);
-    }
 }
